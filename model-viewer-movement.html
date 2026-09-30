@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>SmartSpace Hub Viewer</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #e9e9ec;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  }
+  #scene-container {
+    width: 100%;
+    height: 100%;
+    cursor: grab;
+  }
+  #scene-container.dragging {
+    cursor: grabbing;
+  }
+  #hint {
+    position: fixed;
+    left: 50%;
+    bottom: 24px;
+    transform: translateX(-50%);
+    background: rgba(20, 20, 22, 0.65);
+    color: #fff;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 13px;
+    letter-spacing: 0.01em;
+    pointer-events: none;
+    transition: opacity 0.6s ease;
+  }
+  #status {
+    position: fixed;
+    top: 16px;
+    left: 16px;
+    color: #444;
+    font-size: 13px;
+    background: rgba(255,255,255,0.7);
+    padding: 6px 10px;
+    border-radius: 6px;
+    max-width: 60vw;
+  }
+  #status.error {
+    color: #a11;
+    background: rgba(255,235,235,0.9);
+  }
+</style>
+</head>
+<body>
+
+<div id="scene-container"></div>
+<div id="status">Loading model…</div>
+<div id="hint">Click and drag to look around • WASD to move</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from "three";
+import { FBXLoader } from "three/addons/loaders/FBXLoader.js";
+
+// Disable three.js's internal loader cache (in case it's reusing a
+// previously-loaded buffer within the same page session).
+THREE.Cache.enabled = false;
+
+// Cache-busting query param forces a fresh fetch each load, avoiding
+// stale copies from GitHub's raw-content CDN or the browser cache.
+const MODEL_URL =
+  "https://raw.githubusercontent.com/TomCawthray/SmartSpaceVR/main/SmartSpaceHub.fbx?t=" +
+  Date.now();
+
+console.log("Requesting model from:", MODEL_URL);
+
+const container = document.getElementById("scene-container");
+const statusEl = document.getElementById("status");
+const hintEl = document.getElementById("hint");
+
+// ---- Scene setup ----
+const scene = new THREE.Scene();
+
+// Simple gradient "sky" background, generated on the fly (no image needed).
+function createSkyTexture() {
+  const canvas = document.createElement("canvas");
+  canvas.width = 2;
+  canvas.height = 512;
+  const ctx = canvas.getContext("2d");
+  const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
+  gradient.addColorStop(0, "#3f7fc1");   // zenith blue
+  gradient.addColorStop(0.55, "#bcdcf2"); // mid-sky
+  gradient.addColorStop(1, "#eef6fb");    // near horizon, hazy white
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+scene.background = createSkyTexture();
+
+const camera = new THREE.PerspectiveCamera(
+  60,
+  window.innerWidth / window.innerHeight,
+  0.1,
+  1000000
+);
+camera.position.set(0, 0, 0); // static position at world origin
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+container.appendChild(renderer.domElement);
+
+// ---- Simple neutral studio lighting ----
+const hemiLight = new THREE.HemisphereLight(0x9fc6e8, 0xcccccc, 1.1);
+scene.add(hemiLight);
+
+const keyLight = new THREE.DirectionalLight(0xffffff, 1.0);
+keyLight.position.set(5, 10, 7);
+keyLight.castShadow = true;
+keyLight.shadow.mapSize.set(2048, 2048);
+keyLight.shadow.bias = -0.0005;
+scene.add(keyLight);
+scene.add(keyLight.target);
+
+const fillLight = new THREE.DirectionalLight(0xffffff, 0.4);
+fillLight.position.set(-6, 3, -4);
+scene.add(fillLight);
+
+const ambient = new THREE.AmbientLight(0xffffff, 0.3);
+scene.add(ambient);
+
+// Dedicated light positioned 4m above the world origin (0,0,0), i.e.
+// directly above the camera's fixed position, so the space around the
+// camera is properly lit regardless of where the model's bounding
+// box center ends up.
+const overheadLight = new THREE.PointLight(0xffffff, 2.5, 0, 1.2);
+overheadLight.position.set(0, 4, 0);
+overheadLight.castShadow = true;
+overheadLight.shadow.mapSize.set(1024, 1024);
+overheadLight.shadow.bias = -0.0005;
+overheadLight.shadow.camera.near = 0.1;
+overheadLight.shadow.camera.far = 20;
+scene.add(overheadLight);
+
+// Ground plane to catch the shadow. Repositioned/resized once the
+// model loads and we know its actual bounding box.
+const groundGeo = new THREE.PlaneGeometry(1, 1);
+const groundMat = new THREE.ShadowMaterial({ opacity: 0.35 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ---- "screen" object billboard (rotates on the vertical axis only) ----
+let screenObject = null;
+
+// Confirmed correction values for the "screen" object's mesh orientation.
+const SCREEN_FACING_OFFSET = 2 * Math.PI; // 360° (270° + 90°)
+const SCREEN_X_CORRECTION = (3 * Math.PI) / 2; // 270°
+
+const WORLD_UP = new THREE.Vector3(0, 1, 0);
+const LOCAL_X = new THREE.Vector3(1, 0, 0);
+const screenWorldPos = new THREE.Vector3();
+const dirToCamera = new THREE.Vector3();
+const yawQuat = new THREE.Quaternion();
+const xCorrectionQuat = new THREE.Quaternion();
+const targetWorldQuat = new THREE.Quaternion();
+const parentWorldQuat = new THREE.Quaternion();
+const parentWorldQuatInverse = new THREE.Quaternion();
+
+function updateScreenBillboard() {
+  if (!screenObject) return;
+
+  // Work entirely in world space so the rotation axis is always the
+  // true world-vertical axis, regardless of any rotation baked into
+  // the screen's parent group (a common cause of "wrong axis" spins
+  // with FBX exports from Blender).
+  screenObject.getWorldPosition(screenWorldPos);
+
+  dirToCamera.subVectors(camera.position, screenWorldPos);
+  dirToCamera.y = 0; // ignore vertical difference, rotate on Y only
+  if (dirToCamera.lengthSq() < 1e-8) return; // camera directly above/below, skip
+  dirToCamera.normalize();
+
+  const angle = Math.atan2(dirToCamera.x, dirToCamera.z) + SCREEN_FACING_OFFSET;
+  yawQuat.setFromAxisAngle(WORLD_UP, angle);
+  xCorrectionQuat.setFromAxisAngle(LOCAL_X, SCREEN_X_CORRECTION);
+
+  // Apply the X tilt correction first (in the object's own frame), then
+  // the yaw on top, so the tilt travels with the object as it turns.
+  targetWorldQuat.copy(yawQuat).multiply(xCorrectionQuat);
+
+  // Convert the desired world rotation into the screen's local rotation
+  // by factoring out its parent's current world rotation.
+  if (screenObject.parent) {
+    screenObject.parent.getWorldQuaternion(parentWorldQuat);
+    parentWorldQuatInverse.copy(parentWorldQuat).invert();
+    screenObject.quaternion.copy(parentWorldQuatInverse).multiply(targetWorldQuat);
+  } else {
+    screenObject.quaternion.copy(targetWorldQuat);
+  }
+}
+
+// ---- Load model ----
+const loader = new FBXLoader();
+loader.load(
+  MODEL_URL,
+  (object) => {
+    scene.add(object);
+
+    object.traverse((child) => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+      }
+    });
+
+    // Find the object to billboard toward the camera. Tries an exact
+    // name match first (matches the Blender object name), then falls
+    // back to a case-insensitive search in case FBX export altered casing.
+    screenObject = object.getObjectByName("screen");
+    if (!screenObject) {
+      object.traverse((child) => {
+        if (!screenObject && child.name && child.name.toLowerCase() === "screen") {
+          screenObject = child;
+        }
+      });
+    }
+    if (screenObject) {
+      console.log('Found "screen" object, will billboard toward camera:', screenObject);
+    } else {
+      console.warn(
+        'No object named "screen" was found in the model. Check the exact object name in Blender/the FBX hierarchy.'
+      );
+    }
+
+    // Log bounding box info to help with scale troubleshooting.
+    const box = new THREE.Box3().setFromObject(object);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    console.log("Model bounding box size:", size);
+    console.log("Model bounding box center:", center);
+    console.log(
+      "If the model looks far too big or too small, adjust object.scale.set(x,x,x) in the script."
+    );
+
+    // Fit the ground plane under the model.
+    // GROUND_OFFSET shifts the plane down slightly below the model's
+    // lowest point, so it doesn't z-fight with the model's own floor
+    // geometry (if it has one). Increase the magnitude if the shadow
+    // still looks like it's floating or cutting through the model.
+    const GROUND_OFFSET = 0.02; // in scene units, scaled to model size below
+    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+    const groundSize = maxDim * 6;
+    ground.geometry.dispose();
+    ground.geometry = new THREE.PlaneGeometry(groundSize, groundSize);
+    ground.position.set(
+      center.x,
+      box.min.y - GROUND_OFFSET * maxDim,
+      center.z
+    );
+
+    // Fit the shadow camera frustum to the model so shadows stay sharp.
+    const shadowCam = keyLight.shadow.camera;
+    const pad = maxDim * 0.75;
+    shadowCam.left = -pad;
+    shadowCam.right = pad;
+    shadowCam.top = pad;
+    shadowCam.bottom = -pad;
+    shadowCam.near = 0.1;
+    shadowCam.far = maxDim * 6;
+    shadowCam.updateProjectionMatrix();
+
+    // Position the key light relative to the model's size and aim it
+    // at the model's center so the shadow actually lands on the ground.
+    keyLight.position.set(
+      center.x + maxDim * 0.6,
+      center.y + maxDim * 1.2,
+      center.z + maxDim * 0.8
+    );
+    keyLight.target.position.copy(center);
+    keyLight.target.updateMatrixWorld();
+
+    statusEl.style.display = "none";
+    setTimeout(() => { hintEl.style.opacity = "0"; }, 4000);
+  },
+  (xhr) => {
+    if (xhr.total) {
+      const pct = Math.round((xhr.loaded / xhr.total) * 100);
+      statusEl.textContent = `Loading model… ${pct}%`;
+    }
+  },
+  (error) => {
+    console.error("Error loading FBX:", error);
+    statusEl.textContent =
+      "Failed to load model. Check the console for details (CORS or file path issue).";
+    statusEl.classList.add("error");
+  }
+);
+
+// ---- Mouse-drag look controls (camera stays fixed at 0,0,0) ----
+let yaw = 0;
+let pitch = 0;
+let isDragging = false;
+let lastX = 0;
+let lastY = 0;
+
+const ROTATE_SPEED = 0.0025;
+const PITCH_LIMIT = Math.PI / 2 - 0.01;
+
+camera.rotation.order = "YXZ";
+
+function updateCameraRotation() {
+  camera.rotation.y = yaw;
+  camera.rotation.x = pitch;
+}
+
+container.addEventListener("mousedown", (e) => {
+  isDragging = true;
+  lastX = e.clientX;
+  lastY = e.clientY;
+  container.classList.add("dragging");
+});
+
+window.addEventListener("mouseup", () => {
+  isDragging = false;
+  container.classList.remove("dragging");
+});
+
+window.addEventListener("mousemove", (e) => {
+  if (!isDragging) return;
+  const dx = e.clientX - lastX;
+  const dy = e.clientY - lastY;
+  lastX = e.clientX;
+  lastY = e.clientY;
+
+  yaw -= dx * ROTATE_SPEED;
+  pitch -= dy * ROTATE_SPEED;
+  pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, pitch));
+
+  updateCameraRotation();
+});
+
+// Touch support
+container.addEventListener(
+  "touchstart",
+  (e) => {
+    if (e.touches.length === 1) {
+      isDragging = true;
+      lastX = e.touches[0].clientX;
+      lastY = e.touches[0].clientY;
+    }
+  },
+  { passive: true }
+);
+
+window.addEventListener("touchend", () => {
+  isDragging = false;
+});
+
+window.addEventListener(
+  "touchmove",
+  (e) => {
+    if (!isDragging || e.touches.length !== 1) return;
+    const dx = e.touches[0].clientX - lastX;
+    const dy = e.touches[0].clientY - lastY;
+    lastX = e.touches[0].clientX;
+    lastY = e.touches[0].clientY;
+
+    yaw -= dx * ROTATE_SPEED;
+    pitch -= dy * ROTATE_SPEED;
+    pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, pitch));
+
+    updateCameraRotation();
+  },
+  { passive: true }
+);
+
+// ---- WASD movement (horizontal only, no vertical movement) ----
+// Movement direction is based on yaw only (ignores pitch), so looking
+// up/down doesn't tilt your walking direction.
+const MOVE_SPEED = 500; // meters per second
+const keysPressed = {};
+
+window.addEventListener("keydown", (e) => {
+  keysPressed[e.code] = true;
+});
+window.addEventListener("keyup", (e) => {
+  keysPressed[e.code] = false;
+});
+// Prevent losing key state if the window loses focus mid-press.
+window.addEventListener("blur", () => {
+  for (const key in keysPressed) keysPressed[key] = false;
+});
+
+const UP_AXIS = new THREE.Vector3(0, 1, 0);
+const forwardVec = new THREE.Vector3();
+const rightVec = new THREE.Vector3();
+const moveVec = new THREE.Vector3();
+
+function updateMovement(delta) {
+  forwardVec.set(0, 0, -1).applyAxisAngle(UP_AXIS, yaw);
+  rightVec.set(1, 0, 0).applyAxisAngle(UP_AXIS, yaw);
+
+  moveVec.set(0, 0, 0);
+  if (keysPressed["KeyW"] || keysPressed["ArrowUp"]) moveVec.add(forwardVec);
+  if (keysPressed["KeyS"] || keysPressed["ArrowDown"]) moveVec.sub(forwardVec);
+  if (keysPressed["KeyD"] || keysPressed["ArrowRight"]) moveVec.add(rightVec);
+  if (keysPressed["KeyA"] || keysPressed["ArrowLeft"]) moveVec.sub(rightVec);
+
+  if (moveVec.lengthSq() > 0) {
+    moveVec.normalize().multiplyScalar(MOVE_SPEED * delta);
+    camera.position.x += moveVec.x;
+    camera.position.z += moveVec.z;
+    // camera.position.y is intentionally left untouched — no vertical movement.
+  }
+}
+
+// ---- Resize handling ----
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ---- Render loop ----
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const delta = clock.getDelta();
+  updateMovement(delta);
+  updateScreenBillboard();
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+
+</body>
+</html>
